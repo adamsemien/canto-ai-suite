@@ -17,12 +17,15 @@ type Debug = {
   app_secret_length: number;
   app_secret_preview: string | null;
   app_secret_has_whitespace: boolean;
+  access_token_length: number;
+  access_token_preview: string | null;
   tenant: string | null;
   oauth_request_body_preview: string | null;
 };
 
 type HealthResponse = {
   status: "ok" | "error";
+  auth_flow_used: "direct_token" | "oauth" | null;
   oauth_endpoint_used: string | null;
   auth_method: "bearer" | "query_param" | null;
   token_received: boolean;
@@ -84,10 +87,40 @@ async function tryOauth(
   return { ok: true, token: json.access_token };
 }
 
+async function callSearch(
+  tenant: string,
+  token: string,
+): Promise<
+  | { ok: true; authMethod: "bearer" | "query_param"; title: string | null }
+  | { ok: false; authMethod: "bearer" | "query_param"; status: number; body: string }
+> {
+  const base = `https://${tenant}.canto.com/api/v1/search?keyword=logo&limit=1`;
+
+  let res = await fetch(base, { headers: { Authorization: `Bearer ${token}` } });
+  let authMethod: "bearer" | "query_param" = "bearer";
+
+  if (res.status === 401) {
+    authMethod = "query_param";
+    res = await fetch(`${base}&access_token=${encodeURIComponent(token)}`);
+  }
+
+  if (!res.ok) {
+    const body = await res.text();
+    return { ok: false, authMethod, status: res.status, body };
+  }
+
+  const json = (await res.json()) as {
+    results?: Array<{ name?: string; title?: string }>;
+  };
+  const first = json.results?.[0];
+  return { ok: true, authMethod, title: first?.name ?? first?.title ?? null };
+}
+
 export async function GET(): Promise<NextResponse<HealthResponse>> {
   const appId = process.env.CANTO_APP_ID;
   const appSecret = process.env.CANTO_APP_SECRET;
   const tenant = process.env.CANTO_TENANT;
+  const directToken = process.env.CANTO_ACCESS_TOKEN;
 
   const debug: Debug = {
     app_id_length: appId?.length ?? 0,
@@ -96,13 +129,58 @@ export async function GET(): Promise<NextResponse<HealthResponse>> {
     app_secret_length: appSecret?.length ?? 0,
     app_secret_preview: maskPreview(appSecret, 2, 2),
     app_secret_has_whitespace: appSecret ? appSecret !== appSecret.trim() : false,
+    access_token_length: directToken?.length ?? 0,
+    access_token_preview: maskPreview(directToken, 4, 4),
     tenant: tenant ?? null,
     oauth_request_body_preview: null,
   };
 
-  if (!appId || !appSecret || !tenant) {
+  if (!tenant) {
     return NextResponse.json({
       status: "error",
+      auth_flow_used: null,
+      oauth_endpoint_used: null,
+      auth_method: null,
+      token_received: false,
+      search_sample_title: null,
+      error_step: "oauth",
+      error_detail: "missing env var: CANTO_TENANT",
+      debug,
+    });
+  }
+
+  if (directToken) {
+    const search = await callSearch(tenant, directToken);
+    if (!search.ok) {
+      return NextResponse.json({
+        status: "error",
+        auth_flow_used: "direct_token",
+        oauth_endpoint_used: null,
+        auth_method: search.authMethod,
+        token_received: true,
+        search_sample_title: null,
+        error_step: "search",
+        error_detail: `status=${search.status} body=${search.body.slice(0, 500)}`,
+        debug,
+      });
+    }
+    return NextResponse.json({
+      status: "ok",
+      auth_flow_used: "direct_token",
+      oauth_endpoint_used: null,
+      auth_method: search.authMethod,
+      token_received: true,
+      search_sample_title: search.title,
+      error_step: null,
+      error_detail: null,
+      debug,
+    });
+  }
+
+  if (!appId || !appSecret) {
+    return NextResponse.json({
+      status: "error",
+      auth_flow_used: null,
       oauth_endpoint_used: null,
       auth_method: null,
       token_received: false,
@@ -111,10 +189,9 @@ export async function GET(): Promise<NextResponse<HealthResponse>> {
       error_detail: `missing env vars: ${[
         !appId && "CANTO_APP_ID",
         !appSecret && "CANTO_APP_SECRET",
-        !tenant && "CANTO_TENANT",
       ]
         .filter(Boolean)
-        .join(", ")}`,
+        .join(", ")} (and no CANTO_ACCESS_TOKEN provided)`,
       debug,
     });
   }
@@ -146,6 +223,7 @@ export async function GET(): Promise<NextResponse<HealthResponse>> {
   if (!token || !endpointUsed) {
     return NextResponse.json({
       status: "error",
+      auth_flow_used: "oauth",
       oauth_endpoint_used: null,
       auth_method: null,
       token_received: false,
@@ -156,44 +234,28 @@ export async function GET(): Promise<NextResponse<HealthResponse>> {
     });
   }
 
-  const searchBase = `https://${tenant}.canto.com/api/v1/search?keyword=logo&limit=1`;
-
-  let searchRes = await fetch(searchBase, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  let authMethod: "bearer" | "query_param" = "bearer";
-
-  if (searchRes.status === 401) {
-    authMethod = "query_param";
-    searchRes = await fetch(`${searchBase}&access_token=${encodeURIComponent(token)}`);
-  }
-
-  if (!searchRes.ok) {
-    const body = await searchRes.text();
+  const search = await callSearch(tenant, token);
+  if (!search.ok) {
     return NextResponse.json({
       status: "error",
+      auth_flow_used: "oauth",
       oauth_endpoint_used: endpointUsed,
-      auth_method: authMethod,
+      auth_method: search.authMethod,
       token_received: true,
       search_sample_title: null,
       error_step: "search",
-      error_detail: `status=${searchRes.status} body=${body.slice(0, 500)}`,
+      error_detail: `status=${search.status} body=${search.body.slice(0, 500)}`,
       debug,
     });
   }
 
-  const searchJson = (await searchRes.json()) as {
-    results?: Array<{ name?: string; title?: string }>;
-  };
-  const first = searchJson.results?.[0];
-  const sampleTitle = first?.name ?? first?.title ?? null;
-
   return NextResponse.json({
     status: "ok",
+    auth_flow_used: "oauth",
     oauth_endpoint_used: endpointUsed,
-    auth_method: authMethod,
+    auth_method: search.authMethod,
     token_received: true,
-    search_sample_title: sampleTitle,
+    search_sample_title: search.title,
     error_step: null,
     error_detail: null,
     debug,
